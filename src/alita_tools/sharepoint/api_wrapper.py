@@ -1,6 +1,5 @@
 import logging
 import os
-from io import BytesIO
 from traceback import format_exc
 import json
 from typing import List, Optional, Any, Dict
@@ -8,7 +7,8 @@ from langchain_core.tools import ToolException
 from langchain_core.pydantic_v1 import root_validator, BaseModel
 from pydantic import create_model
 from pydantic.fields import FieldInfo
-from docx import Document
+
+from .utils import read_docx_from_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +21,15 @@ SharepointReadList = create_model(
     list_title=(str, FieldInfo(description="Name of a Sharepoint list to be read."))
 )
 
-SharepointGetFilesInFolder = create_model(
-    "SharepointGetFilesInFolder",
-    folder=(str, FieldInfo(description="Folder name to get list of the files."))
+SharepointGetAllFiles = create_model(
+    "SharepointGetAllFilesModel",
+    limit_files=(int, FieldInfo(description="Limit (maximum number) of files to be returned. Can be called with synonyms, such as First, Top, etc., or can be reflected just by a number for example Top 10 files'. Use default value if not specified in a query WITH NO EXTRA CONFIRMATION FROM A USER"))
+)
+
+SharepointGetAllFilesInFolder = create_model(
+    "SharepointGetAllFilesInFolder",
+    folder_name=(str, FieldInfo(description="Folder name to get list of the files.")),
+    limit_files=(int, FieldInfo(description="Limit (maximum number) of files to be returned. Can be called with synonyms, such as First, Top, etc., or can be reflected just by a number for example Top 10 files'. Use default value if not specified in a query WITH NO EXTRA CONFIRMATION FROM A USER")),
 )
 
 SharepointReadDocument = create_model(
@@ -31,36 +37,11 @@ SharepointReadDocument = create_model(
     path=(str, FieldInfo(description="Contains the server-relative path of the  for reading."))
 )
 
-
-def read_docx(path):
-    """Reads and prints content from a .docx file."""
-    try:
-        doc = Document(path)
-        text = []
-        for paragraph in doc.paragraphs:
-            text.append(paragraph.text)
-        return '\n'.join(text)
-    except Exception as e:
-        print(f"Error reading {path}: {e}")
-        return ""
-
-def read_docx_from_bytes(file_content):
-    """Read and return content from a .docx file using a byte stream."""
-    try:
-        doc = Document(BytesIO(file_content))
-        text = []
-        for paragraph in doc.paragraphs:
-            text.append(paragraph.text)
-        return '\n'.join(text)
-    except Exception as e:
-        print(f"Error reading .docx from bytes: {e}")
-        return ""
-
 class SharepointApiWrapper(BaseModel):
     site_url: str
-    list_title: Optional[str]
     client_id: str
     client_secret: str
+    root_folder: Optional[str]
 
     @root_validator()
     def validate_toolkit(cls, values):
@@ -75,7 +56,7 @@ class SharepointApiWrapper(BaseModel):
             )
 
         site_url = values['site_url']
-        #list_title = values.get('list_title')
+        root_folder = values.get('root_folder')
         client_id = values.get('client_id')
         client_secret = values.get('client_secret')
 
@@ -88,7 +69,6 @@ class SharepointApiWrapper(BaseModel):
                 logging.error("Failed to authenticate with SharePoint.")
         except Exception as e:
                 logging.error(f"Failed to authenticate with SharePoint: {str(e)}")
-
         return values
 
 
@@ -107,37 +87,48 @@ class SharepointApiWrapper(BaseModel):
         except Exception as e:
             logging.error(f"Failed to load items from sharepoint: {e}")
 
-    def get_all_files(self):
-        """ Lists all files from sharepoint."""
+
+    def get_all_files(self, limit_files=10):
+        """Lists files from SharePoint in a root folder (folder_name) if provided; otherwise lists from the main library called Documents, limited by limit_files (default is 10)."""
         try:
-            doc_lib = self.client.web.lists.get_by_title('Documents')
-            items = doc_lib.items
-            self.client.load(items).execute_query()
             result = []
+
+            if self.root_folder:
+                doc_lib = self.client.web.lists.get_by_title(self.root_folder)
+            else:
+                doc_lib = self.client.web.lists.get_by_title('Documents')
+            self.client.load(doc_lib).execute_query()
+            items = doc_lib.items.get().top(limit_files).execute_query()
+
             for item in items:
-                if item.file_system_object_type == 0: #FileSystemObjectType.File
+                if item.file_system_object_type == 0:  # FileSystemObjectType.File
                     file = item.file
                     self.client.load(file).execute_query()
-                    temp_props = {'Name': file.properties['Name'],
-                                 'Path': file.properties['ServerRelativeUrl'],
-                                 'Created': file.properties['TimeCreated'],
-                                 'Modified' : file.properties['TimeLastModified'],
-                                 'Link': file.properties['LinkingUrl']
-                                 }
+                    temp_props = {
+                        'Name': file.properties['Name'],
+                        'Path': file.properties['ServerRelativeUrl'],
+                        'Created': file.properties['TimeCreated'],
+                        'Modified': file.properties['TimeLastModified'],
+                        'Link': file.properties['LinkingUrl']
+                        }
                     result.append(temp_props)
-            #print(result)
             return result
         except Exception as e:
-            logging.error(f"Failed to load files from sharepoint: {e}")
+            logging.error(f"Failed to load files from SharePoint: {e}")
+            return []
 
-    def get_all_files_in_folder(self, folder):
-        """ Lists all files from sharepoint in a specific folder."""
+    def get_all_files_in_folder(self, folder_name, limit_files=10):
+        """ Lists all files from sharepoint in a specific folder, , limited by limit_files (default is 10)."""
         try:
-            target_folder_url = "Shared Documents/" + folder
+            result = []
+
+            target_folder_url = "Shared Documents/" + folder_name
             root_folder = self.client.web.get_folder_by_server_relative_path(target_folder_url)
             files = root_folder.get_files(True).execute_query()
-            result = []
+
             for file in files:
+                if len(result) >= limit_files:
+                    break
                 temp_props = {'Name': file.properties['Name'],
                               'Path': file.properties['ServerRelativeUrl'],
                               'Created': file.properties['TimeCreated'],
@@ -145,10 +136,10 @@ class SharepointApiWrapper(BaseModel):
                               'Link': file.properties['LinkingUrl']
                               }
                 result.append(temp_props)
-            #print(result)
             return result
         except Exception as e:
             logging.error(f"Failed to load files from sharepoint: {e}")
+            return []
 
     def read_file(self, path):
         """ Reads file located at the specified server-relative path """
@@ -182,13 +173,13 @@ class SharepointApiWrapper(BaseModel):
             {
                 "name": "get_all_files",
                 "description": self.get_all_files.__doc__,
-                "args_schema": NoInput,
+                "args_schema": SharepointGetAllFiles,
                 "ref": self.get_all_files
             },
             {
                 "name": "get_all_files_in_folder",
                 "description": self.get_all_files_in_folder.__doc__,
-                "args_schema": SharepointGetFilesInFolder,
+                "args_schema": SharepointGetAllFilesInFolder,
                 "ref": self.get_all_files_in_folder
             },
             {
